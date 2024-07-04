@@ -1,6 +1,7 @@
 const { commandHandler, automodHandler, statsHandler } = require("@src/handlers");
 const { PREFIX_COMMANDS } = require("@root/config");
 const { getSettings } = require("@schemas/Guild");
+const { afk } = require("@handlers/afk");
 
 /**
  * @param {import('@src/structures').BotClient} client
@@ -33,4 +34,5 @@ module.exports = async (client, message) => {
 
   // if not a command
   if (!isCommand) await automodHandler.performAutomod(message, settings);
+  afk(client, message, settings);
 };
