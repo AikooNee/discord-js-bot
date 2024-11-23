@@ -7,13 +7,13 @@ const {
   StringSelectMenuBuilder,
   ComponentType,
 } = require("discord.js");
+const discordTranscripts = require("discord-html-transcripts");
 const { TICKET } = require("@root/config.js");
 
 // schemas
 const { getSettings } = require("@schemas/Guild");
 
 // helpers
-const { postToBin } = require("@helpers/HttpUtils");
 const { error } = require("@helpers/Logger");
 
 const OPEN_PERMS = ["ManageChannels"];
@@ -25,9 +25,9 @@ const CLOSE_PERMS = ["ManageChannels", "ReadMessageHistory"];
 function isTicketChannel(channel) {
   return (
     channel.type === ChannelType.GuildText &&
-    channel.name.startsWith("tіcket-") &&
+    channel.name.startsWith("ticket-") &&
     channel.topic &&
-    channel.topic.startsWith("tіcket|")
+    channel.topic.startsWith("ticket|")
   );
 }
 
@@ -71,62 +71,63 @@ async function closeTicket(channel, closedBy, reason) {
 
   try {
     const config = await getSettings(channel.guild);
-    const messages = await channel.messages.fetch();
-    const reversed = Array.from(messages.values()).reverse();
-
-    let content = "";
-    reversed.forEach((m) => {
-      content += `[${new Date(m.createdAt).toLocaleString("en-US")}] - ${m.author.username}\n`;
-      if (m.cleanContent !== "") content += `${m.cleanContent}\n`;
-      if (m.attachments.size > 0) content += `${m.attachments.map((att) => att.proxyURL).join(", ")}\n`;
-      content += "\n";
-    });
-
-    const logsUrl = await postToBin(content, `Ticket Logs for ${channel.name}`);
     const ticketDetails = await parseTicketDetails(channel);
 
-    const components = [];
-    if (logsUrl) {
-      components.push(
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel("Transcript").setURL(logsUrl.short).setStyle(ButtonStyle.Link)
-        )
-      );
+    const attachment = await discordTranscripts.createTranscript(channel, {
+      limit: -1,
+      returnType: "attachment",
+      filename: `ticket-${channel.name}.html`,
+      saveImages: true,
+      poweredBy: false,
+    });
+
+    let transcript = null;
+    if (config.ticket.log_channel) {
+      const logChannel = channel.guild.channels.cache.get(config.ticket.log_channel);
+      if (logChannel) {
+        const message = await logChannel.send({
+          files: [attachment],
+        });
+        if (message.attachments.size > 0) {
+          transcript = message.attachments.first().url;
+        }
+      }
     }
 
     if (channel.deletable) await channel.delete();
 
     const embed = new EmbedBuilder().setAuthor({ name: "Ticket Closed" }).setColor(TICKET.CLOSE_EMBED);
-    const fields = [];
 
-    if (reason) fields.push({ name: "Reason", value: reason, inline: false });
-    fields.push(
-      {
-        name: "Opened By",
-        value: ticketDetails.user ? ticketDetails.user.username : "Unknown",
-        inline: true,
-      },
-      {
-        name: "Closed By",
-        value: closedBy ? closedBy.username : "Unknown",
-        inline: true,
-      }
-    );
+    const fields = [
+      { name: "Ticket Name", value: channel.name, inline: false },
+      { name: "Transcript", value: transcript ? `[View Transcript](${transcript})` : "Not available", inline: false },
+      { name: "Created At", value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: false },
+      { name: "Opened By", value: ticketDetails.user ? ticketDetails.user.username : "Unknown", inline: false },
+      { name: "Closed By", value: closedBy ? closedBy.username : "Unknown", inline: false },
+    ];
 
     embed.setFields(fields);
 
-    // send embed to log channel
     if (config.ticket.log_channel) {
       const logChannel = channel.guild.channels.cache.get(config.ticket.log_channel);
-      logChannel.safeSend({ embeds: [embed], components });
+      if (logChannel) {
+        await logChannel.safeSend({
+          embeds: [embed],
+          files: transcript ? [] : [attachment],
+        });
+      }
     }
 
-    // send embed to user
     if (ticketDetails.user) {
       const dmEmbed = embed
         .setDescription(`**Server:** ${channel.guild.name}\n**Category:** ${ticketDetails.catName}`)
         .setThumbnail(channel.guild.iconURL());
-      ticketDetails.user.send({ embeds: [dmEmbed], components }).catch((ex) => {});
+      await ticketDetails.user
+        .send({
+          embeds: [dmEmbed],
+          files: transcript ? [] : [attachment],
+        })
+        .catch(() => {});
     }
 
     return "SUCCESS";
@@ -167,21 +168,21 @@ async function handleTicketOpen(interaction) {
     );
 
   const alreadyExists = getExistingTicketChannel(guild, user.id);
-  if (alreadyExists) return interaction.followUp(`You already have an open ticket`);
+  if (alreadyExists) return interaction.followUp("You already have an open ticket");
 
   const settings = await getSettings(guild);
 
   // limit check
   const existing = getTicketChannels(guild).size;
-  if (existing > settings.ticket.limit) return interaction.followUp("There are too many open tickets. Try again later");
+  if (existing >= settings.ticket.limit)
+    return interaction.followUp("There are too many open tickets. Try again later");
 
   // check categories
   let catName = null;
   let catPerms = [];
   const categories = settings.ticket.categories;
   if (categories.length > 0) {
-    const options = [];
-    settings.ticket.categories.forEach((cat) => options.push({ label: cat.name, value: cat.name }));
+    const options = categories.map((cat) => ({ label: cat.name, value: cat.name }));
     const menuRow = new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId("ticket-menu")
@@ -195,9 +196,7 @@ async function handleTicketOpen(interaction) {
         componentType: ComponentType.StringSelect,
         time: 60 * 1000,
       })
-      .catch((err) => {
-        if (err.message.includes("time")) return;
-      });
+      .catch(() => null);
 
     if (!res) return interaction.editReply({ content: "Timed out. Try again", components: [] });
     await interaction.editReply({ content: "Processing", components: [] });
@@ -207,6 +206,7 @@ async function handleTicketOpen(interaction) {
 
   try {
     const ticketNumber = (existing + 1).toString();
+    const ticketName = `${user.username}-${ticketNumber}`;
     const permissionOverwrites = [
       {
         id: guild.roles.everyone,
@@ -223,20 +223,21 @@ async function handleTicketOpen(interaction) {
     ];
 
     if (catPerms?.length > 0) {
-      catPerms?.forEach((roleId) => {
+      catPerms.forEach((roleId) => {
         const role = guild.roles.cache.get(roleId);
-        if (!role) return;
-        permissionOverwrites.push({
-          id: role,
-          allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
-        });
+        if (role) {
+          permissionOverwrites.push({
+            id: role,
+            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
+          });
+        }
       });
     }
 
     const tktChannel = await guild.channels.create({
-      name: `tіcket-${ticketNumber}`,
+      name: ticketName,
       type: ChannelType.GuildText,
-      topic: `tіcket|${user.id}|${catName || "Default"}`,
+      topic: `ticket|${user.id}|${catName || "Default"}`,
       permissionOverwrites,
     });
 
@@ -250,36 +251,20 @@ async function handleTicketOpen(interaction) {
       )
       .setFooter({ text: "You may close your ticket anytime by clicking the button below" });
 
-    let buttonsRow = new ActionRowBuilder().addComponents(
+    const buttonsRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setLabel("Close Ticket")
         .setCustomId("TICKET_CLOSE")
-        .setEmoji("🔒")
+        .setEmoji("ðŸ”’")
         .setStyle(ButtonStyle.Primary)
     );
 
-    const sent = await tktChannel.send({ content: user.toString(), embeds: [embed], components: [buttonsRow] });
+    await tktChannel.send({ content: user.toString(), embeds: [embed], components: [buttonsRow] });
 
-    const dmEmbed = new EmbedBuilder()
-      .setColor(TICKET.CREATE_EMBED)
-      .setAuthor({ name: "Ticket Created" })
-      .setThumbnail(guild.iconURL())
-      .setDescription(
-        `**Server:** ${guild.name}
-        ${catName ? `**Category:** ${catName}` : ""}
-        `
-      );
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel("View Channel").setURL(sent.url).setStyle(ButtonStyle.Link)
-    );
-
-    user.send({ embeds: [dmEmbed], components: [row] }).catch((ex) => {});
-
-    await interaction.editReply(`Ticket created! 🔥`);
+    await interaction.editReply(`Ticket created ðŸ”¥ in <#${tktChannel.id}>`);
   } catch (ex) {
     error("handleTicketOpen", ex);
-    return interaction.editReply("Failed to create ticket channel, an error occurred!");
+    interaction.editReply("Failed to create ticket channel, an error occurred!");
   }
 }
 
@@ -289,19 +274,19 @@ async function handleTicketOpen(interaction) {
 async function handleTicketClose(interaction) {
   await interaction.deferReply({ ephemeral: true });
   const status = await closeTicket(interaction.channel, interaction.user);
-  if (status === "MISSING_PERMISSIONS") {
-    return interaction.followUp("Cannot close the ticket, missing permissions. Contact server manager for help!");
-  } else if (status == "ERROR") {
-    return interaction.followUp("Failed to close the ticket, an error occurred!");
-  }
+  if (status === "SUCCESS") return interaction.editReply("Ticket closed");
+  else if (status === "MISSING_PERMISSIONS")
+    return interaction.editReply("Failed to close ticket. Missing `ManageChannels` permission");
+  else return interaction.editReply("Failed to close ticket. Something went wrong!");
 }
 
 module.exports = {
   getTicketChannels,
   getExistingTicketChannel,
-  isTicketChannel,
-  closeTicket,
-  closeAllTickets,
   handleTicketOpen,
   handleTicketClose,
+  closeTicket,
+  closeAllTickets,
+  isTicketChannel,
 };
+    
